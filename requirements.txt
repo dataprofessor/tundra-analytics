@@ -1,0 +1,6 @@
+streamlit>=1.50
+psycopg2-binary>=2.9
+snowflake-snowpark-python
+pandas>=2.0
+plotly>=5.18
+pydeck>=0.9
