@@ -7,37 +7,32 @@ def show():
     st.header("Executive KPI Summary")
 
     # KPI metrics
-    metrics = run_query_df("""
+    kpi_df = run_query_df("""
         SELECT
-            round(sum(CASE WHEN s.status='active' THEN s.mrr ELSE 0 END)::numeric, 2) AS total_mrr,
-            count(*) FILTER (WHERE s.status='active') AS active_subs,
-            round(100.0 * count(*) FILTER (WHERE s.status='churned') / NULLIF(count(*), 0), 1) AS churn_rate,
-            round((sum(CASE WHEN s.status='active' THEN s.mrr ELSE 0 END) /
-                   NULLIF(count(DISTINCT CASE WHEN s.status='active' THEN s.customer_id END), 0))::numeric, 2) AS arpa
+            sum(s.mrr) FILTER (WHERE s.status = 'active') as total_active_mrr,
+            count(*) FILTER (WHERE s.status = 'active') as active_subs,
+            round(100.0 * count(*) FILTER (WHERE s.status = 'churned')
+                / nullif(count(*), 0), 1) as churn_rate,
+            sum(s.mrr) FILTER (WHERE s.status = 'active')
+                / nullif(count(DISTINCT s.customer_id) FILTER (WHERE s.status = 'active'), 0) as arpa
         FROM subscriptions s
     """)
 
-    if not metrics.empty:
-        row = metrics.iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Active MRR", f"${row['total_mrr']:,.0f}")
-        c2.metric("Active Subscriptions", f"{int(row['active_subs']):,}")
-        c3.metric("Churn Rate", f"{row['churn_rate']}%")
-        c4.metric("ARPA", f"${row['arpa']:,.0f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Active MRR", f"${kpi_df['total_active_mrr'].iloc[0]:,.0f}")
+    c2.metric("Active Subscriptions", f"{kpi_df['active_subs'].iloc[0]:,}")
+    c3.metric("Churn Rate %", f"{kpi_df['churn_rate'].iloc[0]:.1f}%")
+    c4.metric("ARPA", f"${kpi_df['arpa'].iloc[0]:,.0f}")
 
     # 6-month MRR area chart
     st.subheader("MRR Trend (Last 6 Months)")
-    mrr_trend = run_query_df("""
-        SELECT to_char(i.invoice_date, 'YYYY-MM') AS month,
-               round(sum(i.amount)::numeric, 0) AS mrr
-        FROM invoices i
-        WHERE i.invoice_date >= (CURRENT_DATE - INTERVAL '6 months')
-        GROUP BY 1 ORDER BY 1
+    mrr_df = run_query_df("""
+        SELECT to_char(invoice_date, 'YYYY-MM') as month, sum(amount) as mrr
+        FROM invoices
+        WHERE invoice_date >= date_trunc('month', now()) - interval '6 months'
+        GROUP BY month
+        ORDER BY month
     """)
-
-    if not mrr_trend.empty:
-        fig = px.area(mrr_trend, x="month", y="mrr", markers=True)
-        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=350)
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.info("No revenue data for the last 6 months.")
+    if not mrr_df.empty:
+        fig = px.area(mrr_df, x="month", y="mrr", title="Monthly Recurring Revenue")
+        st.plotly_chart(fig, use_container_width=True)

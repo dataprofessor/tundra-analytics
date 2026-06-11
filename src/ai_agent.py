@@ -1,134 +1,129 @@
-import re
 import streamlit as st
-from src.db import run_query_df, get_schema_context
+import re
+from src.db import run_query_df, get_connection, get_schema_context
 from src.cortex import cortex_complete
 
-SYSTEM_PROMPT = """You are an expert SQL analyst for a B2B SaaS company called Tundra.
-You answer questions by writing PostgreSQL queries against the Tundra database.
 
-SCHEMA:
+SYSTEM_PROMPT = """You are a helpful data analyst assistant for a B2B SaaS company called Tundra.
+You have access to a Postgres database with the following schema:
+
 {schema}
 
-IMPORTANT ALLOWED VALUES (use ONLY these exact values in filters):
-- subscriptions.status: 'active', 'trial', 'churned' (NOT 'cancelled')
-- invoices.status: 'paid', 'pending', 'overdue'
-- customers.industry: 'SaaS', 'Finance', 'Healthcare', 'Retail', 'Manufacturing', 'Media'
-- plans.plan_name: 'Starter', 'Pro', 'Enterprise'
-- usage_events.event_type: 'login', 'api_call', 'report_run', 'export'
+Important notes:
+- subscription_period is a TSTZRANGE column (Postgres range type)
+- features on plans is a TEXT[] array, join with: feature = ANY(p.features) or use unnest
+- metadata on usage_events is JSONB
+- country_code is ISO-3166 alpha-3 (3 chars, e.g. USA, GBR, DEU)
+- subscriptions.status values are EXACTLY 'active', 'trial', 'churned'.
+  There is NO 'cancelled' value — for churn use status = 'churned'.
+  Churn rate = count(status='churned') / count(*).
+- plans primary key is plan_id (NOT id); the name column is plan_name
+  (NOT name); join subscriptions with s.plan_id = p.plan_id.
+- country_name lives ONLY on the countries table; customers has just
+  country_code. Join customers.country_code = countries.country_code
+  to show a country name.
+- Use standard PostgreSQL syntax
 
-JOIN KEYS:
-- subscriptions.plan_id = plans.plan_id (NOT plans.id)
-- subscriptions.customer_id = customers.customer_id
-- customers.country_code = countries.country_code
-- country_name lives ONLY on the countries table
-
-RULES:
-- Return SQL in a ```sql code block
-- Use round((expr)::numeric, 2) for rounding (not round(double, int))
-- Always parameterize user values, but for analytical queries use literals for allowed values
-- For plans.features (TEXT[]), use: feature = ANY(p.features) or CROSS JOIN LATERAL unnest(p.features)
-
-EXAMPLE:
-Q: What is the total MRR by country?
-```sql
-SELECT co.country_name, round(sum(s.mrr)::numeric, 2) AS total_mrr
-FROM subscriptions s
-JOIN customers cu ON cu.customer_id = s.customer_id
-JOIN countries co ON co.country_code = cu.country_code
-WHERE s.status = 'active'
-GROUP BY co.country_name
-ORDER BY total_mrr DESC
-LIMIT 20;
-```
+When asked a question, write a SQL query to answer it. Return the SQL in a ```sql code block.
+If the question doesn't require SQL, just answer directly.
 """
 
-WRITE_KEYWORDS = re.compile(r"\b(UPDATE|INSERT|DELETE|ALTER|DROP|TRUNCATE)\b", re.IGNORECASE)
+
+WRITE_KEYWORDS = re.compile(
+    r"\b(UPDATE|INSERT|DELETE|ALTER|DROP|TRUNCATE)\b", re.IGNORECASE
+)
+
+EXAMPLE_QUESTIONS = [
+    "What is the total MRR?",
+    "How many churned customers are there?",
+    "Top 5 countries by active MRR",
+    "Average seats per plan",
+]
 
 
 def show():
     st.header("AI Agent")
-    st.caption("Ask natural language questions about your SaaS data")
-
-    schema_ctx = get_schema_context()
 
     # Model selector
-    model = st.selectbox("Model", ["mistral-large2", "llama3.1-70b"], key="agent_model")
+    model = st.selectbox("Model", ["mistral-large2", "llama3.1-70b"], key="ai_model")
 
-    # Initialize chat history
-    if "agent_messages" not in st.session_state:
-        st.session_state.agent_messages = []
+    # Initialize conversation
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = []
 
-    # Example buttons (rendered unconditionally)
-    examples = [
-        "What is the total MRR?",
-        "How many churned customers are there?",
-        "Top 5 countries by active MRR",
-        "Average seats per plan",
-    ]
-    clicked_example = None
-    cols = st.columns(len(examples))
-    for i, ex in enumerate(examples):
-        if cols[i].button(ex, key=f"agent_ex_{i}"):
-            clicked_example = ex
-
-    # Chat input
-    question = st.chat_input("Ask about your data...") or clicked_example
-
-    # Clear chat
-    if st.button("Clear Chat", key="agent_clear"):
-        st.session_state.agent_messages = []
+    # Clear chat button
+    if st.button("Clear Chat"):
+        st.session_state.ai_messages = []
         st.rerun()
 
-    # Display history
-    for msg in st.session_state.agent_messages:
+    # Display conversation history
+    for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if "dataframe" in msg:
-                st.dataframe(msg["dataframe"], width="stretch")
+                st.dataframe(msg["dataframe"])
 
-    if question:
-        st.session_state.agent_messages.append({"role": "user", "content": question})
+    # Example question buttons (always available as quick prompts).
+    # Render unconditionally: if they only showed while the conversation
+    # was empty, a click after the first exchange would hit a widget that
+    # is no longer created that run, and nothing would happen.
+    example_click = None
+    st.caption("Example questions:")
+    cols = st.columns(len(EXAMPLE_QUESTIONS))
+    for i, q in enumerate(EXAMPLE_QUESTIONS):
+        if cols[i].button(q, key=f"ai_example_{i}"):
+            example_click = q
+
+    # User input (typed in the chat box or chosen from an example button)
+    user_input = st.chat_input("Ask about your data...") or example_click
+    if user_input:
+        st.session_state.ai_messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
-            st.markdown(question)
+            st.markdown(user_input)
 
-        # Build prompt with history
-        history = st.session_state.agent_messages[-6:]
-        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history)
-        full_prompt = (
-            SYSTEM_PROMPT.format(schema=schema_ctx)
-            + "\n\nConversation:\n"
-            + history_text
-            + "\n\nassistant:"
+        # Build prompt with schema and conversation history
+        schema = get_schema_context()
+        system = SYSTEM_PROMPT.format(schema=schema)
+
+        # Include last 6 messages for context
+        history = st.session_state.ai_messages[-6:]
+        history_text = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in history
         )
+        full_prompt = f"{system}\n\nConversation:\n{history_text}\n\nASSISTANT:"
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 response = cortex_complete(full_prompt, model=model)
+
             st.markdown(response)
 
-            # Extract and run SQL
-            sql_blocks = re.findall(r"```sql\s*(.*?)```", response, re.DOTALL)
+            # Check for SQL blocks
+            sql_blocks = re.findall(r"```sql\s*(.*?)\s*```", response, re.DOTALL)
+
             msg_data = {"role": "assistant", "content": response}
 
             for sql in sql_blocks:
                 sql = sql.strip()
                 if WRITE_KEYWORDS.search(sql):
-                    st.warning("This is a write query. Review before executing.")
+                    st.warning("⚠️ This query modifies data:")
+                    st.code(sql, language="sql")
                     if st.button("Confirm & Execute", key=f"confirm_{hash(sql)}"):
-                        df = run_query_df(sql)
-                        if df.empty:
-                            st.info("Query executed but returned no rows.")
-                        else:
-                            st.dataframe(df, width="stretch")
+                        try:
+                            df = run_query_df(sql)
+                            st.dataframe(df)
+                            msg_data["dataframe"] = df
+                        except Exception as e:
+                            st.error(f"Error: {e}")
                 else:
                     try:
                         df = run_query_df(sql)
                         if df.empty:
-                            st.info("Query returned no rows.")
+                            st.info("Query ran successfully but returned no rows.")
                         else:
-                            st.dataframe(df, width="stretch")
+                            st.dataframe(df)
                             msg_data["dataframe"] = df
                     except Exception as e:
-                        st.error(f"SQL Error: {e}")
+                        st.error(f"Error executing SQL: {e}")
 
-            st.session_state.agent_messages.append(msg_data)
+            st.session_state.ai_messages.append(msg_data)
